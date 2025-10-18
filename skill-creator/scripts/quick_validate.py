@@ -96,7 +96,68 @@ def _parse_frontmatter_without_yaml(frontmatter_raw: str) -> dict[str, Any]:
         if stripped_line.startswith('- '):
             if not isinstance(container, list):
                 raise ValueError('List item found outside of a list context in frontmatter')
-            container.append(_clean_scalar(stripped_line[2:]))
+
+            item_content = stripped_line[2:].strip()
+
+            if not item_content:
+                lookahead_index, lookahead_line = next_nonempty_line(index)
+                if lookahead_index is None:
+                    container.append('')
+                    continue
+
+                next_indent = len(lookahead_line) - len(lookahead_line.lstrip(' '))
+                if next_indent <= indent:
+                    container.append('')
+                    continue
+
+                nested_container: dict[str, Any] | list[Any]
+                if lookahead_line.strip().startswith('- '):
+                    nested_container = []
+                else:
+                    nested_container = {}
+
+                container.append(nested_container)
+                stack.append((next_indent, nested_container))
+                continue
+
+            if (
+                item_content[0] not in "'\"[{"
+                and re.search(r':(\s|$)', item_content)
+            ):
+                key, value = item_content.split(':', 1)
+                key = key.strip()
+                if not key:
+                    raise ValueError('List item contains an empty mapping key')
+
+                value = value.strip()
+                item_mapping: dict[str, Any] = {}
+                pending_stack_entries: list[tuple[int, dict[str, Any] | list[Any]]] = []
+
+                if value:
+                    item_mapping[key] = _clean_scalar(value)
+                else:
+                    lookahead_index, lookahead_line = next_nonempty_line(index)
+                    if lookahead_index is None:
+                        item_mapping[key] = ''
+                    else:
+                        next_indent = len(lookahead_line) - len(lookahead_line.lstrip(' '))
+                        if next_indent <= indent:
+                            item_mapping[key] = ''
+                        else:
+                            nested_container: dict[str, Any] | list[Any]
+                            if lookahead_line.strip().startswith('- '):
+                                nested_container = []
+                            else:
+                                nested_container = {}
+                            item_mapping[key] = nested_container
+                            pending_stack_entries.append((next_indent, nested_container))
+
+                container.append(item_mapping)
+                stack.append((indent + 2, item_mapping))
+                stack.extend(pending_stack_entries)
+                continue
+
+            container.append(_clean_scalar(item_content))
             continue
 
         if ':' not in stripped_line:
