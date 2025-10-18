@@ -1,65 +1,245 @@
 #!/usr/bin/env python3
-"""
-Quick validation script for skills - minimal version
-"""
+"""Quick validation script for skills - minimal version."""
 
-import sys
-import os
+from __future__ import annotations
+
 import re
+import sys
 from pathlib import Path
+from typing import Any
 
-def validate_skill(skill_path):
-    """Basic validation of a skill"""
+try:  # pragma: no cover - PyYAML is optional
+    import yaml  # type: ignore
+except ModuleNotFoundError:  # pragma: no cover - fallback when PyYAML isn't installed
+    yaml = None
+
+
+FRONTMATTER_BOUNDARY = '---'
+ALLOWED_FRONTMATTER_KEYS = {'name', 'description', 'license', 'allowed-tools', 'metadata'}
+REQUIRED_FRONTMATTER_KEYS = ('name', 'description')
+
+
+def _extract_frontmatter(content: str) -> str | None:
+    """Return the raw YAML frontmatter block from SKILL.md."""
+
+    if not content.startswith(FRONTMATTER_BOUNDARY):
+        return None
+
+    lines = content.splitlines()
+    for index, line in enumerate(lines[1:], start=1):
+        if line.strip() == FRONTMATTER_BOUNDARY:
+            return '\n'.join(lines[1:index])
+    return None
+
+
+def _clean_scalar(value: str) -> Any:
+    """Normalize scalar values parsed from frontmatter."""
+
+    value = value.strip()
+    if value.startswith('[') and value.endswith(']'):
+        inner = value[1:-1].strip()
+        if not inner:
+            return []
+        return [_clean_scalar(part.strip()) for part in inner.split(',')]
+    if value.startswith('{') and value.endswith('}'):
+        inner = value[1:-1].strip()
+        if not inner:
+            return {}
+        mapping: dict[str, Any] = {}
+        for item in inner.split(','):
+            if ':' not in item:
+                raise ValueError(f'Invalid inline mapping entry in frontmatter: {item}')
+            key, raw_value = item.split(':', 1)
+            mapping[key.strip()] = _clean_scalar(raw_value.strip())
+        return mapping
+    if value.startswith(("'", '"')) and value.endswith(("'", '"')) and len(value) >= 2:
+        return value[1:-1].strip()
+    return value
+
+
+def _parse_frontmatter_without_yaml(frontmatter_raw: str) -> dict[str, Any]:
+    """Minimal YAML parsing fallback for environments without PyYAML."""
+
+    def next_nonempty_line(start_index: int) -> tuple[int, str] | tuple[None, None]:
+        for offset in range(start_index, len(lines)):
+            candidate = lines[offset]
+            if candidate.strip():
+                return offset, candidate
+        return None, None
+
+    lines = frontmatter_raw.splitlines()
+    data: dict[str, Any] = {}
+    stack: list[tuple[int, dict[str, Any] | list[Any]]] = [(0, data)]
+    index = 0
+
+    while index < len(lines):
+        raw_line = lines[index]
+        index += 1
+        stripped_line = raw_line.strip()
+
+        if not stripped_line:
+            continue
+
+        if '\t' in raw_line:
+            raise ValueError('Frontmatter cannot contain tab characters for indentation')
+
+        indent = len(raw_line) - len(raw_line.lstrip(' '))
+
+        while stack and indent < stack[-1][0]:
+            stack.pop()
+
+        if not stack:
+            raise ValueError('Invalid indentation structure in frontmatter')
+
+        container = stack[-1][1]
+
+        if stripped_line.startswith('- '):
+            if not isinstance(container, list):
+                raise ValueError('List item found outside of a list context in frontmatter')
+            container.append(_clean_scalar(stripped_line[2:]))
+            continue
+
+        if ':' not in stripped_line:
+            raise ValueError(f'Invalid frontmatter line: {stripped_line}')
+
+        key, value = stripped_line.split(':', 1)
+        key = key.strip()
+        value = value.strip()
+
+        if not isinstance(container, dict):
+            raise ValueError('Invalid nesting in frontmatter structure')
+
+        if value:
+            container[key] = _clean_scalar(value)
+            continue
+
+        lookahead_index, lookahead_line = next_nonempty_line(index)
+        if lookahead_index is None:
+            container[key] = ''
+            continue
+
+        next_indent = len(lookahead_line) - len(lookahead_line.lstrip(' '))
+        if next_indent <= indent:
+            container[key] = ''
+            continue
+
+        nested_container: dict[str, Any] | list[Any]
+        if lookahead_line.strip().startswith('- '):
+            nested_container = []
+        else:
+            nested_container = {}
+
+        container[key] = nested_container
+        stack.append((next_indent, nested_container))
+
+    return data
+
+
+def _load_frontmatter(frontmatter_raw: str) -> dict[str, Any]:
+    """Load frontmatter using PyYAML when available, else fallback parser."""
+
+    if yaml is not None:
+        try:
+            loaded = yaml.safe_load(frontmatter_raw) or {}
+        except Exception as exc:  # pragma: no cover - PyYAML provides detailed error
+            raise ValueError(f'Invalid YAML frontmatter: {exc}') from exc
+
+        if not isinstance(loaded, dict):
+            raise ValueError('Frontmatter must be a mapping of key/value pairs')
+
+        return loaded
+
+    return _parse_frontmatter_without_yaml(frontmatter_raw)
+
+
+def _validate_metadata(metadata: dict[str, Any]) -> tuple[bool, str | None]:
+    for key, value in metadata.items():
+        if not isinstance(key, str) or not key.strip():
+            return False, "Metadata keys must be non-empty strings"
+        if isinstance(value, (dict, list)):
+            continue
+        if value is None:
+            continue
+        if not isinstance(value, (str, int, float, bool)):
+            return False, f"Unsupported metadata value type for key '{key}'"
+    return True, None
+
+
+def validate_skill(skill_path: str | Path) -> tuple[bool, str]:
+    """Basic validation of a skill."""
+
     skill_path = Path(skill_path)
-    
-    # Check SKILL.md exists
+
     skill_md = skill_path / 'SKILL.md'
     if not skill_md.exists():
-        return False, "SKILL.md not found"
-    
-    # Read and validate frontmatter
-    content = skill_md.read_text()
-    if not content.startswith('---'):
-        return False, "No YAML frontmatter found"
-    
-    # Extract frontmatter
-    match = re.match(r'^---\n(.*?)\n---', content, re.DOTALL)
-    if not match:
-        return False, "Invalid frontmatter format"
-    
-    frontmatter = match.group(1)
-    
-    # Check required fields
-    if 'name:' not in frontmatter:
-        return False, "Missing 'name' in frontmatter"
-    if 'description:' not in frontmatter:
-        return False, "Missing 'description' in frontmatter"
-    
-    # Extract name for validation
-    name_match = re.search(r'name:\s*(.+)', frontmatter)
-    if name_match:
-        name = name_match.group(1).strip()
-        # Check naming convention (hyphen-case: lowercase with hyphens)
-        if not re.match(r'^[a-z0-9-]+$', name):
-            return False, f"Name '{name}' should be hyphen-case (lowercase letters, digits, and hyphens only)"
-        if name.startswith('-') or name.endswith('-') or '--' in name:
-            return False, f"Name '{name}' cannot start/end with hyphen or contain consecutive hyphens"
+        return False, 'SKILL.md not found'
 
-    # Extract and validate description
-    desc_match = re.search(r'description:\s*(.+)', frontmatter)
-    if desc_match:
-        description = desc_match.group(1).strip()
-        # Check for angle brackets
-        if '<' in description or '>' in description:
-            return False, "Description cannot contain angle brackets (< or >)"
+    content = skill_md.read_text(encoding='utf-8')
+    frontmatter_raw = _extract_frontmatter(content)
+    if frontmatter_raw is None:
+        return False, 'No YAML frontmatter found'
 
-    return True, "Skill is valid!"
+    try:
+        frontmatter = _load_frontmatter(frontmatter_raw)
+    except ValueError as exc:
+        return False, str(exc)
 
-if __name__ == "__main__":
-    if len(sys.argv) != 2:
-        print("Usage: python quick_validate.py <skill_directory>")
-        sys.exit(1)
-    
-    valid, message = validate_skill(sys.argv[1])
+    unexpected_keys = [key for key in frontmatter if key not in ALLOWED_FRONTMATTER_KEYS]
+    if unexpected_keys:
+        allowed_keys_display = ', '.join(sorted(ALLOWED_FRONTMATTER_KEYS))
+        unexpected_display = ', '.join(sorted(unexpected_keys))
+        return (
+            False,
+            "Unexpected key(s) in SKILL.md frontmatter: "
+            f"{unexpected_display}. Allowed keys: {allowed_keys_display}. Move extras into 'metadata'.",
+        )
+
+    missing_required = [key for key in REQUIRED_FRONTMATTER_KEYS if not str(frontmatter.get(key, '')).strip()]
+    if missing_required:
+        missing_display = ', '.join(missing_required)
+        return False, f"Missing required frontmatter field(s): {missing_display}"
+
+    name = str(frontmatter.get('name', '')).strip()
+    if not re.fullmatch(r'[a-z0-9-]+', name):
+        return False, 'Name must be hyphen-case (lowercase letters, digits, and hyphens only)'
+    if name.startswith('-') or name.endswith('-') or '--' in name:
+        return False, 'Name cannot start/end with a hyphen or contain consecutive hyphens'
+
+    description = str(frontmatter.get('description', '')).strip()
+    if '<' in description or '>' in description:
+        return False, 'Description cannot contain angle brackets (< or >)'
+
+    license_value = frontmatter.get('license')
+    if license_value is not None and not str(license_value).strip():
+        return False, "'license' value cannot be empty if provided"
+
+    allowed_tools = frontmatter.get('allowed-tools')
+    if allowed_tools is not None:
+        if not isinstance(allowed_tools, list):
+            return False, "'allowed-tools' must be a list of tool names"
+        if any(not isinstance(tool, str) or not tool.strip() for tool in allowed_tools):
+            return False, "Each entry in 'allowed-tools' must be a non-empty string"
+
+    metadata = frontmatter.get('metadata')
+    if metadata is not None:
+        if not isinstance(metadata, dict):
+            return False, "'metadata' must be a mapping of additional properties"
+        metadata_valid, metadata_error = _validate_metadata(metadata)
+        if not metadata_valid:
+            return False, metadata_error or 'Invalid metadata values'
+
+    return True, 'Skill is valid!'
+
+
+def _main(argv: list[str]) -> int:
+    if len(argv) != 2:
+        print('Usage: python quick_validate.py <skill_directory>')
+        return 1
+
+    valid, message = validate_skill(argv[1])
     print(message)
-    sys.exit(0 if valid else 1)
+    return 0 if valid else 1
+
+
+if __name__ == '__main__':
+    sys.exit(_main(sys.argv))

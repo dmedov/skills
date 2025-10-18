@@ -43,6 +43,12 @@ skill-name/
 
 **Metadata Quality:** The `name` and `description` in YAML frontmatter determine when Claude will use the skill. Be specific about what the skill does and when to use it. Use the third-person (e.g. "This skill should be used when..." instead of "Use this skill when...").
 
+**Frontmatter Properties:** Only include supported keys in the YAML frontmatter to avoid packaging errors.
+
+- Required: `name`, `description`
+- Optional: `license`, `allowed-tools`, `metadata`
+- Excluded: Any other top-level fields (for example `version`). Place additional values inside the `metadata` object instead of adding new keys.
+
 #### Bundled Resources (optional)
 
 ##### Scripts (`scripts/`)
